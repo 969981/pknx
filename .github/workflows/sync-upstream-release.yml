@@ -1,0 +1,130 @@
+name: Sync official pkNX and publish Windows release
+
+on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: pknx-upstream-sync-and-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync kwsch/pkNX master
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      head_sha: ${{ steps.upstream.outputs.head_sha }}
+      upstream_sha: ${{ steps.upstream.outputs.upstream_sha }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      publish: ${{ steps.upstream.outputs.publish }}
+    steps:
+      - name: Checkout our production master branch
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Merge official upstream without overwriting local work
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/kwsch/pkNX.git
+          git fetch --no-tags upstream master
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git merge --no-edit "$upstream_sha"
+            git push origin HEAD:master
+          fi
+          head_sha="$(git rev-parse HEAD)"
+          tag="auto-${head_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Release already present for $head_sha; skip build."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Release missing for $head_sha; build Windows package."
+          fi
+
+  build:
+    name: Build pkNX for Windows x64
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout synced production commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.head_sha }}
+          fetch-depth: 0
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish WinForms application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish pkNX.WinForms/pkNX.WinForms.csproj --configuration Release --runtime win-x64 --self-contained false --output "$env:RUNNER_TEMP/pknx-publish"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "$env:RUNNER_TEMP/pknx-publish/pkNX.exe")) {
+            throw "pkNX.exe missing from publish output"
+          }
+          Compress-Archive -Path "$env:RUNNER_TEMP/pknx-publish/*" -DestinationPath "$env:RUNNER_TEMP/pkNX-win-x64.zip" -Force
+      - name: Upload complete Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pknx-win-x64
+          path: ${{ runner.temp }}/pkNX-win-x64.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: [sync, build]
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows archive
+        uses: actions/download-artifact@v4
+        with:
+          name: pknx-win-x64
+          path: release-assets
+      - name: Create release only when package exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          HEAD_SHA: ${{ needs.sync.outputs.head_sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          test -s release-assets/pkNX-win-x64.zip
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists; skip duplicate."
+            exit 0
+          fi
+          printf 'Automated Windows x64 build from the production master branch.\n\nOfficial upstream: https://github.com/kwsch/pkNX\nUpstream commit: %s\nBuild commit: %s\n\nRequires .NET 10 Desktop Runtime.\n' "$UPSTREAM_SHA" "$HEAD_SHA" > notes.txt
+          gh release create "$TAG" "release-assets/pkNX-win-x64.zip#pkNX-win-x64.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$HEAD_SHA" \
+            --title "pkNX Windows x64 ($TAG)" \
+            --notes-file notes.txt \
+            --latest
